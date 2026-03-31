@@ -1,4 +1,3 @@
-
 #include <string.h>
 #include <assert.h>
 #include <stdbool.h>
@@ -10,6 +9,7 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "driver/uart.h"
 #include "esp_log.h"
 
 #include "esp_lcd_panel_io.h"
@@ -23,7 +23,6 @@
 
 #include "lvgl.h"
 #include "esp_lvgl_port.h"
-#include "driver/uart.h"
 
 LV_FONT_DECLARE(rus20);
 LV_FONT_DECLARE(rus24);
@@ -60,23 +59,26 @@ LV_FONT_DECLARE(rus30);
 #define FONT_SMALL (&rus20)
 #define FONT_BIG   (&rus30)
 
-#define MB_UART_NUM              UART_NUM_1
-#define MB_RXD_PIN               1
-#define MB_RTS_PIN               2
-#define MB_TXD_PIN               42
+#define MB_UART_NUM                UART_NUM_1
+#define MB_RXD_PIN                 1
+#define MB_RTS_PIN                 2
+#define MB_TXD_PIN                 42
 
-#define MB_SLAVE_ADDR            1
-#define MB_BAUD_RATE             9600
-#define MB_RX_BUF_SIZE           256
-#define MB_TX_BUF_SIZE           256
+#define MB_SLAVE_ADDR              1
+#define MB_BAUD_RATE               9600
+#define MB_RX_BUF_SIZE             256
+#define MB_TX_BUF_SIZE             256
 
-#define MB_REG_COUNT             7
+/* 0..6 old regs, 7..62 weekly schedule (28 times * 2 words) */
+#define MB_REG_COUNT               63
 
-static uint16_t status_flags = 0x0001;   /* bit0 = Auto */
-static portMUX_TYPE reg_lock = portMUX_INITIALIZER_UNLOCKED;
-
+#define TIMER_STEP_SEC             900U
+#define DAY_SEC                    86400U
 
 static const char *TAG = "CLIMATE_UI";
+
+static uint16_t status_flags = 0x0001;
+static portMUX_TYPE reg_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static esp_lcd_panel_handle_t panel_handle = NULL;
 static esp_lcd_panel_io_handle_t lcd_io_handle = NULL;
@@ -94,7 +96,37 @@ static int16_t co2_ppm = 1750;
 static int16_t temp_setpoint = 400;
 static int16_t hum_setpoint = 40;
 
-/* -------- UI refs -------- */
+/* -------- weekly schedule -------- */
+/* times are stored in seconds from start of day:
+ * 17:30 = 63000
+ * 21:00 = 75600
+ */
+typedef struct {
+    uint32_t on1_s;
+    uint32_t off1_s;
+    uint32_t on2_s;
+    uint32_t off2_s;
+} day_schedule_t;
+
+static day_schedule_t week_schedule[7] = {
+    {63000, 75600,     0,     0},   /* Mon */
+    {63000, 75600,     0,     0},   /* Tue */
+    {63000, 75600,     0,     0},   /* Wed */
+    {63000, 75600,     0,     0},   /* Thu */
+    {63000, 75600,     0,     0},   /* Fri */
+    {    0,     0,     0,     0},   /* Sat */
+    {    0,     0,     0,     0},   /* Sun */
+};
+
+static uint8_t selected_day = 0;
+static const char *day_names[7] = {
+    "ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"
+};
+
+/* -------- UI refs main -------- */
+static lv_obj_t *screen_main = NULL;
+static lv_obj_t *screen_schedule = NULL;
+
 static lv_obj_t *lbl_room_temp = NULL;
 static lv_obj_t *lbl_room_hum = NULL;
 static lv_obj_t *lbl_duct_temp = NULL;
@@ -111,6 +143,13 @@ static lv_obj_t *box_duct_temp = NULL;
 static lv_obj_t *box_co2 = NULL;
 static lv_obj_t *box_temp_set = NULL;
 static lv_obj_t *box_hum_set = NULL;
+
+/* -------- UI refs schedule -------- */
+static lv_obj_t *lbl_day_name = NULL;
+static lv_obj_t *lbl_on1 = NULL;
+static lv_obj_t *lbl_off1 = NULL;
+static lv_obj_t *lbl_on2 = NULL;
+static lv_obj_t *lbl_off2 = NULL;
 
 /* -------- styles -------- */
 static lv_style_t style_topbar;
@@ -143,6 +182,42 @@ static void fmt_temp_tenths(char *buf, size_t buf_size, int16_t value_tenths, bo
         } else {
             snprintf(buf, buf_size, "%d.%d", whole, frac);
         }
+    }
+}
+
+static void fmt_time_hhmm(char *buf, size_t buf_size, uint32_t sec)
+{
+    uint32_t hh = sec / 3600U;
+    uint32_t mm = (sec % 3600U) / 60U;
+    snprintf(buf, buf_size, "%02lu:%02lu",
+             (unsigned long)hh,
+             (unsigned long)mm);
+}
+
+static uint32_t time_add_step_sec(uint32_t t, int32_t delta_sec)
+{
+    int32_t v = (int32_t)t + delta_sec;
+
+    while (v < 0) {
+        v += (int32_t)DAY_SEC;
+    }
+    while (v >= (int32_t)DAY_SEC) {
+        v -= (int32_t)DAY_SEC;
+    }
+
+    return (uint32_t)v;
+}
+
+static uint32_t *schedule_point_ptr(uint8_t day, uint8_t point)
+{
+    if (day > 6 || point > 3) return NULL;
+
+    switch (point) {
+        case 0: return &week_schedule[day].on1_s;
+        case 1: return &week_schedule[day].off1_s;
+        case 2: return &week_schedule[day].on2_s;
+        case 3: return &week_schedule[day].off2_s;
+        default: return NULL;
     }
 }
 
@@ -402,11 +477,42 @@ static void refresh_values(void)
     }
 }
 
+static void refresh_schedule_screen(void)
+{
+    char buf[16];
+
+    if (lbl_day_name) {
+        lv_label_set_text(lbl_day_name, day_names[selected_day]);
+    }
+
+    if (lbl_on1) {
+        fmt_time_hhmm(buf, sizeof(buf), week_schedule[selected_day].on1_s);
+        lv_label_set_text(lbl_on1, buf);
+        lv_obj_center(lbl_on1);
+    }
+    if (lbl_off1) {
+        fmt_time_hhmm(buf, sizeof(buf), week_schedule[selected_day].off1_s);
+        lv_label_set_text(lbl_off1, buf);
+        lv_obj_center(lbl_off1);
+    }
+    if (lbl_on2) {
+        fmt_time_hhmm(buf, sizeof(buf), week_schedule[selected_day].on2_s);
+        lv_label_set_text(lbl_on2, buf);
+        lv_obj_center(lbl_on2);
+    }
+    if (lbl_off2) {
+        fmt_time_hhmm(buf, sizeof(buf), week_schedule[selected_day].off2_s);
+        lv_label_set_text(lbl_off2, buf);
+        lv_obj_center(lbl_off2);
+    }
+}
+
 static void set_status_text(const char *txt)
 {
     if (lbl_status) lv_label_set_text(lbl_status, txt);
 }
 
+/* -------- main screen buttons -------- */
 typedef enum {
     ACT_TEMP_MINUS,
     ACT_TEMP_PLUS,
@@ -420,27 +526,27 @@ static void btn_event_cb(lv_event_t *e)
 
     switch (action) {
         case ACT_TEMP_MINUS:
-            temp_setpoint -= 5;        /* 0.5 C */
-            if (temp_setpoint < 250) temp_setpoint = 250;   /* 10.0 C */
-            set_status_text("Temp set -");
+            temp_setpoint -= 5;
+            if (temp_setpoint < 250) temp_setpoint = 250;
+            set_status_text("T -");
             break;
 
         case ACT_TEMP_PLUS:
-            temp_setpoint += 5;        /* 0.5 C */
-            if (temp_setpoint > 400) temp_setpoint = 400;   /* 35.0 C */
-            set_status_text("Temp set +");
+            temp_setpoint += 5;
+            if (temp_setpoint > 400) temp_setpoint = 400;
+            set_status_text("T +");
             break;
 
         case ACT_HUM_MINUS:
             hum_setpoint -= 1;
             if (hum_setpoint < 40) hum_setpoint = 40;
-            set_status_text("Hum set -");
+            set_status_text("RH -");
             break;
 
         case ACT_HUM_PLUS:
             hum_setpoint += 1;
             if (hum_setpoint > 60) hum_setpoint = 60;
-            set_status_text("Hum set +");
+            set_status_text("RH +");
             break;
     }
 
@@ -451,7 +557,7 @@ static lv_obj_t *create_pm_button(lv_obj_t *parent, const char *txt, int x, int 
 {
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_size(btn, 40, 40);
-    lv_obj_set_pos(btn, x, y-5);
+    lv_obj_set_pos(btn, x, y - 5);
     lv_obj_add_style(btn, &style_btn, 0);
     lv_obj_add_event_cb(btn, btn_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)act);
 
@@ -463,6 +569,130 @@ static lv_obj_t *create_pm_button(lv_obj_t *parent, const char *txt, int x, int 
     return btn;
 }
 
+/* -------- schedule screen buttons -------- */
+typedef enum {
+    SCH_DAY_PREV,
+    SCH_DAY_NEXT,
+    SCH_ON1_PLUS,
+    SCH_ON1_MINUS,
+    SCH_OFF1_PLUS,
+    SCH_OFF1_MINUS,
+    SCH_ON2_PLUS,
+    SCH_ON2_MINUS,
+    SCH_OFF2_PLUS,
+    SCH_OFF2_MINUS,
+    SCH_BACK
+} schedule_action_t;
+
+static void schedule_event_cb(lv_event_t *e)
+{
+    schedule_action_t act = (schedule_action_t)(intptr_t)lv_event_get_user_data(e);
+
+    switch (act) {
+        case SCH_DAY_PREV:
+            selected_day = (selected_day == 0) ? 6 : (selected_day - 1);
+            break;
+        case SCH_DAY_NEXT:
+            selected_day = (selected_day + 1) % 7;
+            break;
+        case SCH_ON1_PLUS:
+            week_schedule[selected_day].on1_s =
+                time_add_step_sec(week_schedule[selected_day].on1_s, +((int32_t)TIMER_STEP_SEC));
+            break;
+        case SCH_ON1_MINUS:
+            week_schedule[selected_day].on1_s =
+                time_add_step_sec(week_schedule[selected_day].on1_s, -((int32_t)TIMER_STEP_SEC));
+            break;
+        case SCH_OFF1_PLUS:
+            week_schedule[selected_day].off1_s =
+                time_add_step_sec(week_schedule[selected_day].off1_s, +((int32_t)TIMER_STEP_SEC));
+            break;
+        case SCH_OFF1_MINUS:
+            week_schedule[selected_day].off1_s =
+                time_add_step_sec(week_schedule[selected_day].off1_s, -((int32_t)TIMER_STEP_SEC));
+            break;
+        case SCH_ON2_PLUS:
+            week_schedule[selected_day].on2_s =
+                time_add_step_sec(week_schedule[selected_day].on2_s, +((int32_t)TIMER_STEP_SEC));
+            break;
+        case SCH_ON2_MINUS:
+            week_schedule[selected_day].on2_s =
+                time_add_step_sec(week_schedule[selected_day].on2_s, -((int32_t)TIMER_STEP_SEC));
+            break;
+        case SCH_OFF2_PLUS:
+            week_schedule[selected_day].off2_s =
+                time_add_step_sec(week_schedule[selected_day].off2_s, +((int32_t)TIMER_STEP_SEC));
+            break;
+        case SCH_OFF2_MINUS:
+            week_schedule[selected_day].off2_s =
+                time_add_step_sec(week_schedule[selected_day].off2_s, -((int32_t)TIMER_STEP_SEC));
+            break;
+        case SCH_BACK:
+            if (screen_main) {
+                lv_screen_load(screen_main);
+            }
+            return;
+    }
+
+    refresh_schedule_screen();
+}
+
+static void open_schedule_cb(lv_event_t *e)
+{
+    (void)e;
+    refresh_schedule_screen();
+    if (screen_schedule) {
+        lv_screen_load(screen_schedule);
+    }
+}
+
+static lv_obj_t *create_time_editor(lv_obj_t *parent, int x, int y,
+                                    const char *title,
+                                    lv_obj_t **out_label,
+                                    schedule_action_t plus_act,
+                                    schedule_action_t minus_act)
+{
+    lv_obj_t *cont = create_panel(parent, x, y, 180, 100, &style_panel_big);
+
+    lv_obj_t *t = lv_label_create(cont);
+    lv_label_set_text(t, title);
+    lv_obj_set_style_text_font(t, FONT_TITLE, 0);
+    lv_obj_set_style_text_color(t, lv_color_white(), 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 0);
+
+    lv_obj_t *btn_plus = lv_button_create(cont);
+    lv_obj_set_size(btn_plus, 54, 24);
+    lv_obj_set_pos(btn_plus, 63, 24);
+    lv_obj_add_style(btn_plus, &style_btn, 0);
+    lv_obj_add_event_cb(btn_plus, schedule_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)plus_act);
+
+    lv_obj_t *lp = lv_label_create(btn_plus);
+    lv_label_set_text(lp, "+");
+    lv_obj_set_style_text_font(lp, FONT_TITLE, 0);
+    lv_obj_set_style_text_color(lp, lv_color_white(), 0);
+    lv_obj_center(lp);
+
+    lv_obj_t *box = create_value_box(cont, 28, 52, 124, 28);
+    *out_label = lv_label_create(box);
+    lv_obj_set_style_text_font(*out_label, FONT_VALUE, 0);
+    lv_obj_set_style_text_color(*out_label, lv_color_white(), 0);
+
+    lv_obj_t *btn_minus = lv_button_create(cont);
+    lv_obj_set_size(btn_minus, 54, 24);
+    lv_obj_set_pos(btn_minus, 63, 82);
+    lv_obj_add_style(btn_minus, &style_btn, 0);
+    lv_obj_add_event_cb(btn_minus, schedule_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)minus_act);
+
+    lv_obj_t *lm = lv_label_create(btn_minus);
+    lv_label_set_text(lm, "-");
+    lv_obj_set_style_text_font(lm, FONT_TITLE, 0);
+    lv_obj_set_style_text_color(lm, lv_color_white(), 0);
+    lv_obj_center(lm);
+
+    return cont;
+}
+
+/* -------- create screens -------- */
 static void ui_create(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -479,16 +709,28 @@ static void ui_create(void)
     lv_obj_align(sys, LV_ALIGN_LEFT_MID, 6, 0);
 
     lbl_mode = lv_label_create(top);
-    lv_label_set_text(lbl_mode, "Auto");
+    lv_label_set_text(lbl_mode, "RUN");
     lv_obj_set_style_text_color(lbl_mode, lv_color_hex(0xFFA51E), 0);
     lv_obj_set_style_text_font(lbl_mode, FONT_TITLE, 0);
-    lv_obj_align(lbl_mode, LV_ALIGN_CENTER, 30, 0);
+    lv_obj_align(lbl_mode, LV_ALIGN_CENTER, 20, 0);
 
     lbl_status = lv_label_create(top);
-    lv_label_set_text(lbl_status, "Normal");
+    lv_label_set_text(lbl_status, "OK");
     lv_obj_set_style_text_color(lbl_status, lv_color_white(), 0);
     lv_obj_set_style_text_font(lbl_status, FONT_TITLE, 0);
     lv_obj_align(lbl_status, LV_ALIGN_RIGHT_MID, -6, 0);
+
+    lv_obj_t *btn_schedule = lv_button_create(top);
+    lv_obj_set_size(btn_schedule, 92, 24);
+    lv_obj_set_pos(btn_schedule, 358, 4);
+    lv_obj_add_style(btn_schedule, &style_btn, 0);
+    lv_obj_add_event_cb(btn_schedule, open_schedule_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *lbl_sched = lv_label_create(btn_schedule);
+    lv_label_set_text(lbl_sched, "ГРАФИК");
+    lv_obj_set_style_text_font(lbl_sched, FONT_MAIN, 0);
+    lv_obj_set_style_text_color(lbl_sched, lv_color_white(), 0);
+    lv_obj_center(lbl_sched);
 
     lv_obj_t *p_temp = create_panel(scr, 8, 46, 228, 104, &style_panel_big);
     lv_obj_t *p_hum  = create_panel(scr, 244, 46, 228, 104, &style_panel_big);
@@ -542,7 +784,7 @@ static void ui_create(void)
     lv_obj_t *p_set_rh = create_panel(scr, 244, 224, 228, 88, &style_setpanel);
 
     lv_obj_t *st = lv_label_create(p_set_t);
-    lv_label_set_text(st, "уставка Т");
+    lv_label_set_text(st, "Уставка Т");
     lv_obj_set_style_text_font(st, FONT_TITLE, 0);
     lv_obj_set_style_text_color(st, lv_color_white(), 0);
     lv_obj_set_pos(st, 6, 4);
@@ -555,7 +797,7 @@ static void ui_create(void)
     create_pm_button(p_set_t, "+", 174, 42, ACT_TEMP_PLUS);
 
     lv_obj_t *srh = lv_label_create(p_set_rh);
-    lv_label_set_text(srh, "уставка RH");
+    lv_label_set_text(srh, "Уставка RH");
     lv_obj_set_style_text_font(srh, FONT_TITLE, 0);
     lv_obj_set_style_text_color(srh, lv_color_white(), 0);
     lv_obj_set_pos(srh, 6, 4);
@@ -570,8 +812,63 @@ static void ui_create(void)
     refresh_values();
 }
 
+static void schedule_screen_create(void)
+{
+    screen_schedule = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(screen_schedule, lv_color_hex(0x08121D), 0);
 
+    lv_obj_t *top = create_panel(screen_schedule, 8, 6, 464, 40, &style_topbar);
 
+    lv_obj_t *btn_prev = lv_button_create(top);
+    lv_obj_set_size(btn_prev, 40, 28);
+    lv_obj_set_pos(btn_prev, 8, 6);
+    lv_obj_add_style(btn_prev, &style_btn, 0);
+    lv_obj_add_event_cb(btn_prev, schedule_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)SCH_DAY_PREV);
+
+    lv_obj_t *lbl_prev = lv_label_create(btn_prev);
+    lv_label_set_text(lbl_prev, "<");
+    lv_obj_set_style_text_font(lbl_prev, FONT_TITLE, 0);
+    lv_obj_set_style_text_color(lbl_prev, lv_color_white(), 0);
+    lv_obj_center(lbl_prev);
+
+    lbl_day_name = lv_label_create(top);
+    lv_obj_set_style_text_font(lbl_day_name, FONT_BIG, 0);
+    lv_obj_set_style_text_color(lbl_day_name, lv_color_hex(0xFFA51E), 0);
+    lv_obj_align(lbl_day_name, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *btn_next = lv_button_create(top);
+    lv_obj_set_size(btn_next, 40, 28);
+    lv_obj_set_pos(btn_next, 416, 6);
+    lv_obj_add_style(btn_next, &style_btn, 0);
+    lv_obj_add_event_cb(btn_next, schedule_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)SCH_DAY_NEXT);
+
+    lv_obj_t *lbl_next = lv_label_create(btn_next);
+    lv_label_set_text(lbl_next, ">");
+    lv_obj_set_style_text_font(lbl_next, FONT_TITLE, 0);
+    lv_obj_set_style_text_color(lbl_next, lv_color_white(), 0);
+    lv_obj_center(lbl_next);
+
+    create_time_editor(screen_schedule, 28, 60,  "ВКЛ1",  &lbl_on1,  SCH_ON1_PLUS,  SCH_ON1_MINUS);
+    create_time_editor(screen_schedule, 272, 60, "ВЫКЛ1", &lbl_off1, SCH_OFF1_PLUS, SCH_OFF1_MINUS);
+    create_time_editor(screen_schedule, 28, 176, "ВКЛ2",  &lbl_on2,  SCH_ON2_PLUS,  SCH_ON2_MINUS);
+    create_time_editor(screen_schedule, 272, 176, "ВЫКЛ2", &lbl_off2, SCH_OFF2_PLUS, SCH_OFF2_MINUS);
+
+    lv_obj_t *btn_back = lv_button_create(screen_schedule);
+    lv_obj_set_size(btn_back, 120, 34);
+    lv_obj_set_pos(btn_back, 180, 282);
+    lv_obj_add_style(btn_back, &style_btn, 0);
+    lv_obj_add_event_cb(btn_back, schedule_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)SCH_BACK);
+
+    lv_obj_t *lbl_back = lv_label_create(btn_back);
+    lv_label_set_text(lbl_back, "НАЗАД");
+    lv_obj_set_style_text_font(lbl_back, FONT_TITLE, 0);
+    lv_obj_set_style_text_color(lbl_back, lv_color_white(), 0);
+    lv_obj_center(lbl_back);
+
+    refresh_schedule_screen();
+}
+
+/* -------- Modbus helpers -------- */
 static uint16_t mb_crc16(const uint8_t *data, uint16_t len)
 {
     uint16_t crc = 0xFFFF;
@@ -595,18 +892,34 @@ static uint16_t reg_read_u16(uint16_t reg)
     uint16_t value = 0;
 
     portENTER_CRITICAL(&reg_lock);
-    switch (reg) {
-        case 0: value = (uint16_t)room_temp; break;
-        case 1: value = (uint16_t)room_hum; break;
-        case 2: value = (uint16_t)duct_temp; break;
-        case 3: value = (uint16_t)co2_ppm; break;
-        case 4: value = (uint16_t)temp_setpoint; break;
-        case 5: value = (uint16_t)hum_setpoint; break;
-        case 6: value = status_flags; break;
-        default: value = 0; break;
-    }
-    portEXIT_CRITICAL(&reg_lock);
 
+    if (reg <= 6) {
+        switch (reg) {
+            case 0: value = (uint16_t)room_temp; break;
+            case 1: value = (uint16_t)room_hum; break;
+            case 2: value = (uint16_t)duct_temp; break;
+            case 3: value = (uint16_t)co2_ppm; break;
+            case 4: value = (uint16_t)temp_setpoint; break;
+            case 5: value = (uint16_t)hum_setpoint; break;
+            case 6: value = status_flags; break;
+            default: value = 0; break;
+        }
+    } else {
+        uint16_t idx = reg - 7;            /* 0..55 */
+        uint8_t point_index = idx / 2;     /* 0..27 */
+        uint8_t word_index  = idx % 2;     /* 0 high, 1 low */
+
+        uint8_t day   = point_index / 4;   /* 0..6 */
+        uint8_t point = point_index % 4;   /* 0..3 */
+
+        uint32_t *p = schedule_point_ptr(day, point);
+        if (p) {
+            uint32_t v = *p;
+            value = (word_index == 0) ? (uint16_t)(v >> 16) : (uint16_t)(v & 0xFFFFU);
+        }
+    }
+
+    portEXIT_CRITICAL(&reg_lock);
     return value;
 }
 
@@ -615,45 +928,66 @@ static bool reg_write_u16(uint16_t reg, uint16_t value)
     bool ok = true;
 
     portENTER_CRITICAL(&reg_lock);
-    switch (reg) {
-        case 0:
-            room_temp = (int16_t)value;
-            break;
 
-        case 1:
-            room_hum = (int16_t)value;
-            break;
+    if (reg <= 6) {
+        switch (reg) {
+            case 0:
+                room_temp = (int16_t)value;
+                break;
+            case 1:
+                room_hum = (int16_t)value;
+                break;
+            case 2:
+                duct_temp = (int16_t)value;
+                break;
+            case 3:
+                co2_ppm = (int16_t)value;
+                break;
+            case 4:
+                temp_setpoint = (int16_t)value;
+                if (temp_setpoint < 250) temp_setpoint = 250;
+                if (temp_setpoint > 400) temp_setpoint = 400;
+                break;
+            case 5:
+                hum_setpoint = (int16_t)value;
+                if (hum_setpoint < 40) hum_setpoint = 40;
+                if (hum_setpoint > 60) hum_setpoint = 60;
+                break;
+            case 6:
+                status_flags = value;
+                break;
+            default:
+                ok = false;
+                break;
+        }
+    } else {
+        uint16_t idx = reg - 7;           
+        uint8_t point_index = idx / 2;    
+        uint8_t word_index  = idx % 2;    
 
-        case 2:
-            duct_temp = (int16_t)value;
-            break;
+        uint8_t day   = point_index / 4;
+        uint8_t point = point_index % 4;
 
-        case 3:
-            co2_ppm = (int16_t)value;
-            break;
+        uint32_t *p = schedule_point_ptr(day, point);
+        if (p) {
+            uint32_t v = *p;
+            if (word_index == 0) {
+                v = (v & 0x0000FFFFUL) | ((uint32_t)value << 16);
+            } else {
+                v = (v & 0xFFFF0000UL) | (uint32_t)value;
+            }
 
-        case 4:
-            temp_setpoint = (int16_t)value;
-            if (temp_setpoint < 250) temp_setpoint = 250;   /* 25.0 C */
-            if (temp_setpoint > 400) temp_setpoint = 400;   /* 40.0 C */
-            break;
+            if (v >= DAY_SEC) {
+                v = 0;
+            }
 
-        case 5:
-            hum_setpoint = (int16_t)value;
-            if (hum_setpoint < 30) hum_setpoint = 30;
-            if (hum_setpoint > 60) hum_setpoint = 60;
-            break;
-
-        case 6:
-            status_flags = value;
-            break;
-
-        default:
+            *p = v;
+        } else {
             ok = false;
-            break;
+        }
     }
-    portEXIT_CRITICAL(&reg_lock);
 
+    portEXIT_CRITICAL(&reg_lock);
     return ok;
 }
 
@@ -829,6 +1163,7 @@ static void modbus_slave_task(void *arg)
 
         lvgl_port_lock(0);
         refresh_values();
+        refresh_schedule_screen();
         lvgl_port_unlock();
     }
 }
@@ -847,14 +1182,14 @@ static void modbus_init(void)
     ESP_ERROR_CHECK(uart_driver_install(MB_UART_NUM, MB_RX_BUF_SIZE, MB_TX_BUF_SIZE, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(MB_UART_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(MB_UART_NUM, MB_TXD_PIN, MB_RXD_PIN, MB_RTS_PIN, UART_PIN_NO_CHANGE));
-
-    /* Half duplex RS485, RTS controls driver direction */
     ESP_ERROR_CHECK(uart_set_mode(MB_UART_NUM, UART_MODE_RS485_HALF_DUPLEX));
 
     xTaskCreate(modbus_slave_task, "modbus_slave_task", 4096, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "Modbus RTU slave started: addr=%d baud=%d", MB_SLAVE_ADDR, MB_BAUD_RATE);
+    ESP_LOGI(TAG, "Modbus RTU slave started: addr=%d baud=%d regs=%d",
+             MB_SLAVE_ADDR, MB_BAUD_RATE, MB_REG_COUNT);
 }
+
 /* -------- app main -------- */
 void app_main(void)
 {
@@ -902,11 +1237,13 @@ void app_main(void)
 
     lvgl_port_lock(0);
     ui_create();
+    screen_main = lv_screen_active();
+    schedule_screen_create();
     lvgl_port_unlock();
 
     modbus_init();
 
-    ESP_LOGI(TAG, "Climate UI ready");
+    ESP_LOGI(TAG, "Climate UI + Schedule ready");
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
