@@ -652,34 +652,17 @@ static lv_obj_t *create_time_editor(lv_obj_t *parent, int x, int y,
                                     schedule_action_t plus_act,
                                     schedule_action_t minus_act)
 {
-    lv_obj_t *cont = create_panel(parent, x, y, 180, 100, &style_panel_big);
+    lv_obj_t *cont = create_panel(parent, x, y, 420, 44, &style_panel_small);
 
     lv_obj_t *t = lv_label_create(cont);
     lv_label_set_text(t, title);
     lv_obj_set_style_text_font(t, FONT_TITLE, 0);
     lv_obj_set_style_text_color(t, lv_color_white(), 0);
-    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 0);
-
-    lv_obj_t *btn_plus = lv_button_create(cont);
-    lv_obj_set_size(btn_plus, 54, 24);
-    lv_obj_set_pos(btn_plus, 63, 24);
-    lv_obj_add_style(btn_plus, &style_btn, 0);
-    lv_obj_add_event_cb(btn_plus, schedule_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)plus_act);
-
-    lv_obj_t *lp = lv_label_create(btn_plus);
-    lv_label_set_text(lp, "+");
-    lv_obj_set_style_text_font(lp, FONT_TITLE, 0);
-    lv_obj_set_style_text_color(lp, lv_color_white(), 0);
-    lv_obj_center(lp);
-
-    lv_obj_t *box = create_value_box(cont, 28, 52, 124, 28);
-    *out_label = lv_label_create(box);
-    lv_obj_set_style_text_font(*out_label, FONT_VALUE, 0);
-    lv_obj_set_style_text_color(*out_label, lv_color_white(), 0);
+    lv_obj_align(t, LV_ALIGN_LEFT_MID, 8, 0);
 
     lv_obj_t *btn_minus = lv_button_create(cont);
-    lv_obj_set_size(btn_minus, 54, 24);
-    lv_obj_set_pos(btn_minus, 63, 82);
+    lv_obj_set_size(btn_minus, 44, 30);
+    lv_obj_set_pos(btn_minus, 170, 7);
     lv_obj_add_style(btn_minus, &style_btn, 0);
     lv_obj_add_event_cb(btn_minus, schedule_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)minus_act);
 
@@ -688,6 +671,24 @@ static lv_obj_t *create_time_editor(lv_obj_t *parent, int x, int y,
     lv_obj_set_style_text_font(lm, FONT_TITLE, 0);
     lv_obj_set_style_text_color(lm, lv_color_white(), 0);
     lv_obj_center(lm);
+
+    lv_obj_t *box = create_value_box(cont, 220, 7, 110, 30);
+    *out_label = lv_label_create(box);
+    lv_obj_set_style_text_font(*out_label, FONT_VALUE, 0);
+    lv_obj_set_style_text_color(*out_label, lv_color_white(), 0);
+    lv_obj_center(*out_label);
+
+    lv_obj_t *btn_plus = lv_button_create(cont);
+    lv_obj_set_size(btn_plus, 44, 30);
+    lv_obj_set_pos(btn_plus, 338, 7);
+    lv_obj_add_style(btn_plus, &style_btn, 0);
+    lv_obj_add_event_cb(btn_plus, schedule_event_cb, LV_EVENT_CLICKED, (void *)(intptr_t)plus_act);
+
+    lv_obj_t *lp = lv_label_create(btn_plus);
+    lv_label_set_text(lp, "+");
+    lv_obj_set_style_text_font(lp, FONT_TITLE, 0);
+    lv_obj_set_style_text_color(lp, lv_color_white(), 0);
+    lv_obj_center(lp);
 
     return cont;
 }
@@ -848,10 +849,10 @@ static void schedule_screen_create(void)
     lv_obj_set_style_text_color(lbl_next, lv_color_white(), 0);
     lv_obj_center(lbl_next);
 
-    create_time_editor(screen_schedule, 28, 60,  "ВКЛ1",  &lbl_on1,  SCH_ON1_PLUS,  SCH_ON1_MINUS);
-    create_time_editor(screen_schedule, 272, 60, "ВЫКЛ1", &lbl_off1, SCH_OFF1_PLUS, SCH_OFF1_MINUS);
-    create_time_editor(screen_schedule, 28, 176, "ВКЛ2",  &lbl_on2,  SCH_ON2_PLUS,  SCH_ON2_MINUS);
-    create_time_editor(screen_schedule, 272, 176, "ВЫКЛ2", &lbl_off2, SCH_OFF2_PLUS, SCH_OFF2_MINUS);
+    create_time_editor(screen_schedule, 30, 60,  "ВКЛ1",  &lbl_on1,  SCH_ON1_PLUS,  SCH_ON1_MINUS);
+create_time_editor(screen_schedule, 30, 112, "ВЫКЛ1", &lbl_off1, SCH_OFF1_PLUS, SCH_OFF1_MINUS);
+create_time_editor(screen_schedule, 30, 164, "ВКЛ2",  &lbl_on2,  SCH_ON2_PLUS,  SCH_ON2_MINUS);
+create_time_editor(screen_schedule, 30, 216, "ВЫКЛ2", &lbl_off2, SCH_OFF2_PLUS, SCH_OFF2_MINUS);
 
     lv_obj_t *btn_back = lv_button_create(screen_schedule);
     lv_obj_set_size(btn_back, 120, 34);
